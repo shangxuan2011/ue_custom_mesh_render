@@ -1,0 +1,221 @@
+#include "/Engine/Private/VertexFactoryCommon.ush"
+
+#define VF_ColorIndexMask_Index 0
+#define VF_NumTexcoords_Index 1
+#define FV_LightMapIndex_Index 2
+#define VF_VertexOffset 3
+
+struct FVertexFactoryInput
+{
+    float4 Position : ATTRIBUTE0;
+    float3 TangentX : ATTRIBUTE1;
+    float4 TangentZ : ATTRIBUTE2;
+#if MANUAL_VERTEX_FETCH
+    uint VertexId : SV_VertexID;
+#endif
+};
+
+struct FVertexFactoryIntermediates
+{
+    // Position in world space
+    float3 Position;
+    // Vertex color
+    half4 Color;
+    // Tangent matrix
+    half3x3 TangentToLocal;
+    half3x3 TangentToWorld;
+    half TangentToWorldSign;
+};
+
+
+//NUM_TEX_COORD_INTERPOLATORS是材质蓝图编译过程中在 MaterialTemplate.ush中定义的。
+//因为代码会根据材质编译自动生成，所以Shader文件不要包含MaterialTemplate.ush
+//这里用float4是为了满足对齐规则，后续可根据索引奇偶选择分量。
+struct FVertexFactoryInterpolantsVSToPS
+{
+#if NUM_TEX_COORD_INTERPOLATORS
+    float4 TexCoords[(NUM_TEX_COORD_INTERPOLATORS+1)/2]	: TEXCOORD0;
+#endif
+    float4 TangentToWorld0 : TEXCOORD1_centroid;
+    float4 TangentToWorld2 : TEXCOORD2_centroid;
+};
+
+
+//用于将 FVertexFactoryInput转换为 FVertexFactoryIntermediates。
+//在该函数中，通过InstanceData，分别计算Tangent Space 到Local Space和Tanget Space到World Space的矩阵
+//获得场景数据
+FInstanceSceneData GetInstanceData()
+{
+     // 暂时使用场景UniformBuffer中的数据
+    return GetSceneDataIntermediates().InstanceData;
+}
+
+FSceneDataIntermediates GetSceneDataIntermediates(FVertexFactoryIntermediates Intermediates)
+{
+    return GetSceneDataIntermediates();
+}
+
+
+#if NUM_TEX_COORD_INTERPOLATORS
+float2 GetUV(FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex) {
+    float4 UVVector = Interpolants.TexCoords[UVIndex / 2];
+    return UVIndex % 2 ? UVVector.zw : UVVector.xy;
+}
+
+void SetUV(inout FVertexFactoryInterpolantsVSToPS Interpolants, int UVIndex, float2 InValue) {
+    FLATTEN
+    if(UVIndex % 2) {
+        Interpolants.TexCoords[UVIndex / 2].zw = InValue;
+    }
+    else {
+        Interpolants.TexCoords[UVIndex / 2].xy = InValue;
+    }
+}
+#endif
+
+// 计算切空间到本地空间的矩阵
+half3x3 CalcTangentToLocal(FVertexFactoryInput Input, out float TangentSign)
+{
+    half3x3 Result;
+    half3 TangentInputX = Input.TangentX;
+    half4 TangentInputZ = Input.TangentZ;
+    half3 TangentX = TangentBias(TangentInputX);
+    half4 TangentZ = TangentBias(TangentInputZ);
+    TangentSign = TangentZ.w;
+
+    half3 TangentY = cross(TangentZ.xyz, TangentX.xyz) * TangentZ.w;
+    Result[0] = cross(TangentY, TangentZ.xyz) * TangentSign;
+    Result[1] = TangentY;
+    Result[2] = TangentZ.xyz;
+    return Result;
+}
+
+// 计算切线空间到世界空间的矩阵
+half3x3 CalcTangentToWorldNoScale(half3x3 TangentToLocal)
+{
+    half3x3 LocalToWorld = (half3x3) DFToFloat3x3(GetInstanceData().LocalToWorld);
+    half3 InvScale = GetInstanceData().InvNonUniformScale;
+    LocalToWorld[0] *= InvScale.x;
+    LocalToWorld[1] *= InvScale.y;
+    LocalToWorld[2] *= InvScale.z;
+    return mul(TangentToLocal, LocalToWorld);
+}
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+    FVertexFactoryIntermediates Result;
+    Result.Position = Input.Position.xyz;
+    float TangentSign;
+    Result.TangentToLocal = CalcTangentToLocal(Input, TangentSign);
+    Result.TangentToWorld = CalcTangentToWorldNoScale(Result.TangentToLocal);
+    Result.TangentToWorldSign = TangentSign * GetInstanceData().DeterminantSign;
+    return Result;
+}
+
+//用于VS获取顶点的世界坐标，直接通过VertexFactoryCommon.ush中的TransformLocalToTranslatedWorld函数计算。
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+    FDFMatrix LocalToWorld = GetInstanceData().LocalToWorld;
+    return TransformLocalToTranslatedWorld(Input.Position.xyz, LocalToWorld);
+}
+
+//用于VS中获取切线空间到本地空间的矩阵，直接从FVertexFactoryIntermediates获取。
+float3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+    return Intermediates.TangentToLocal;
+}
+
+
+//获取世界坐标法线，直接从FVertexFactoryIntermediates获取
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+    return Intermediates.TangentToWorld[2];
+}
+
+//用于获取VS中的材质参数，需要返回一个FMaterialVertexParameters结构。将坐标、矩阵等数据填充进去即可 
+FMaterialVertexParameters GetMaterialVertexParameters(
+    FVertexFactoryInput Input, 
+    FVertexFactoryIntermediates Intermediates,
+    float3 WorldPosition,
+	half3x3 TangentToLocal,
+	bool bIsPreviousFrame = false)
+{
+    FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+    Result.SceneData = GetSceneDataIntermediates(Intermediates); // 使用UniformBuffer
+    Result.WorldPosition = WorldPosition;
+    Result.VertexColor = half4(1.0f, 1.0f, 1.0f, 1.0f);
+    Result.TangentToWorld = mul(TangentToLocal, GetLocalToWorld3x3(Result));
+    
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+    // 从MyMeshVF.VertexFetch_Parameters中获取UV数量，用于计算索引
+    // 其中MyMeshVF就是我们在C++中定义的Uniform参数。Shader中并没有定义该参数，这是因为UE会帮我们自动生成该参数的定义。
+	const uint NumFetchTexCoords = MyMeshVF.VertexFetch_Parameters[VF_NumTexcoords_Index];
+	UNROLL
+	for (uint CoordinateIndex = 0; CoordinateIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; CoordinateIndex++)
+	{
+		// Clamp coordinates to mesh's maximum as materials can request more than are available
+		uint ClampedCoordinateIndex = min(CoordinateIndex, NumFetchTexCoords-1);
+                // 从Buffer中获取索引
+		Result.TexCoords[CoordinateIndex] = MyMeshVF.VertexFetch_TexCoordBuffer[NumFetchTexCoords * (MyMeshVF.VertexFetch_Parameters[VF_VertexOffset] + Input.VertexId) + ClampedCoordinateIndex];
+	}
+#endif
+    return Result;
+}
+
+//用于生成从VS到PS的 FVertexFactoryInterpolantsVSToPS数据，这里填充矩阵需要的数据即可
+FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+    FVertexFactoryInterpolantsVSToPS Interpolants = (FVertexFactoryInterpolantsVSToPS) 0;
+    
+    //GetMaterialCustomizedUVs和 GetCustomInterpolators 也是在MaterialTemplate.ush中
+#if NUM_TEX_COORD_INTERPOLATORS
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+	GetMaterialCustomizedUVs(VertexParameters, CustomizedUVs);
+	GetCustomInterpolators(VertexParameters, CustomizedUVs);
+	
+	UNROLL
+	for (int CoordinateIndex = 0; CoordinateIndex < NUM_TEX_COORD_INTERPOLATORS; CoordinateIndex++){
+		SetUV(Interpolants, CoordinateIndex, CustomizedUVs[CoordinateIndex]);
+	}
+#endif
+    
+    Interpolants.TangentToWorld0 = float4(Intermediates.TangentToWorld[0], 0.0f);
+    Interpolants.TangentToWorld2 = float4(Intermediates.TangentToWorld[2], Intermediates.TangentToWorldSign);
+    return Interpolants;
+}
+
+//用于获取PS中的材质参数，需要返回一个FMaterialPixelParameters结构。这里主要通过FVertexFactoryInterpolantsVSToPS计算切空间矩阵：
+FMaterialPixelParameters GetMaterialPixelParameters(FVertexFactoryInterpolantsVSToPS Interpolants, float4 SVPosition)
+{
+    FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+#if NUM_MATERIAL_TEXCOORDS
+    UNROLL
+    for(int CoordIndex=0; CoordIndex<NUM_MATERIAL_TEXCOORDS; ++CoordIndex) {
+        Result.TexCoords[CoordIndex] = GetUV(Interpolants, CoordIndex);
+    }
+#endif
+    half3 TangentToWorld0 = Interpolants.TangentToWorld0.xyz;
+    half4 TangentToWorld2 = Interpolants.TangentToWorld2;
+    Result.TangentToWorld = AssembleTangentToWorld(TangentToWorld0, TangentToWorld2);
+    Result.PrimitiveId = 0;
+    Result.TwoSidedSign = 1;
+    return Result;
+}
+
+//用于修正进入裁剪空间前的世界坐标，某些网格可能会在这里修改世界坐标，直接返回世界坐标即可。
+float4 VertexFactoryGetRasterizedWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float4 TranslatedWorldPosition)
+{
+    return TranslatedWorldPosition;
+}
+
+//用于获取前一帧的世界坐标，常用于TAA类似的算法，这里暂不处理，返回当前坐标即可。
+float4 VertexFactoryGetPreviousWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+    return VertexFactoryGetWorldPosition(Input, Intermediates);
+}
+
+
+//由于我们有自定义FSceneDataIntermediates结构，所以这里重新定义了GetSceneDataIntermediates函数
+//并用 VF_IMPLEMENTED_GET_SCENE_DATA_INTERMEDIATES宏禁用了头文件中的同名函数。
+#define VF_IMPLEMENTED_GET_SCENE_DATA_INTERMEDIATES
+#include "/Engine/Private/VertexFactoryDefaultInterface.ush"
